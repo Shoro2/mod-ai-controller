@@ -1,25 +1,82 @@
-# SKELETON - Module template
+# AzerothCore: Server-Side AI Controller Mod
 
-[English](README.md) | [Español](README_ES.md)
+![C++](https://img.shields.io/badge/Language-C++-blue) ![AzerothCore](https://img.shields.io/badge/Core-AzerothCore%203.3.5-red) ![Status](https://img.shields.io/badge/Status-Experimental-orange)
 
+This module implements a **server-side AI controller** for AzerothCore, allowing external agents (e.g., Python Reinforcement Learning models) to control in-game player characters via a TCP socket connection.
 
-## How to create your own module
+It acts as a bridge between the World of Warcraft server logic and an external AI environment (Gymnasium / Stable Baselines3).
 
-1. Use the script `create_module.sh` located in [`modules/`](https://github.com/azerothcore/azerothcore-wotlk/tree/master/modules) to start quickly with all the files you need and your git repo configured correctly (heavily recommended).
-1. You can then use these scripts to start your project: https://github.com/azerothcore/azerothcore-boilerplates
-1. Do not hesitate to compare with some of our newer/bigger/famous modules.
-1. Edit the `README.md` and other files (`include.sh` etc...) to fit your module. Note: the README is automatically created from `README_example.md` when you use the script `create_module.sh`.
-1. Publish your module to our [catalogue](https://www.azerothcore.org/catalogue.html).
+## Features
 
+### Core Functionality
+* **Socket Communication:** Establishes a TCP server on port `5000` to exchange JSON data with external clients.
+* **Real-time State Export:** Sends player data (HP, Mana, Position, Combat State, Nearby Mobs) at a configurable tick rate (Fast: 400ms, Radar: 2000ms).
+* **Command Execution:** Receives and executes high-level actions from the AI:
+    * `move_forward`, `turn_left`, `turn_right`, `stop`
+    * `move_to:x:y:z` (Smart navigation using MMaps/Pathfinding)
+    * `cast:spellID` (Automatic target selection and facing)
+    * `target_guid`, `loot_guid`, `sell_grey`
+    * `reset` (Teleport to homebind, restore HP/Mana for training loops)
 
-## How to test your module?
+### Advanced AI Logic
+* **Auto-Targeting:** Detects nearby attackable targets and filters critters/pets.
+* **Auto-Looting:** Simulates server-side looting behavior (Money & Items) without client interaction.
+* **Auto-Equip:** Automatically equips looted items if they provide better stats (based on a simple ItemScore heuristic).
+* **Vendor Interaction:** Detects vendors and sells junk items automatically to free up bag space.
+* **Combat Tracking:** Automatically faces the target during combat/casting to prevent "Target not in front" errors.
 
-Disable PCH (precompiled headers) and try to compile. To disable PCH, set `-DNOPCH=1` with Cmake (more info [here](http://www.azerothcore.org/wiki/CMake-options)).
+## 🛠 Architecture
 
-If you forgot some headers, it is time to add them!
+The module hooks into the AzerothCore engine at two points:
 
-## Licensing
+1.  **`AIControllerPlayerScript`**: Handles game events like XP gain, Level Up (auto-reset for training), and Money changes.
+2.  **`AIControllerWorldScript`**: Runs the main update loop:
+    * **Fast Tick (400ms):** Processes the command queue (thread-safe) and broadcasts the player state.
+    * **Slow Tick (2000ms):** Performs expensive grid scans (`Cell::VisitObjects`) to detect nearby entities.
+    * **Face Tick (150ms):** Keeps the player facing their target during combat.
 
-The default license of the skeleton-module template is the MIT but you can use a different license for your own modules.
+## Installation
 
-So modules can also be kept private. However, if you need to add new hooks to the core, as well as improving existing ones, you have to share your improvements because the main core is released under the AGPL license. Please [provide a PR](https://www.azerothcore.org/wiki/How-to-create-a-PR) if that is the case.
+1.  Copy the `mod-ai-controller` folder into your `azerothcore/modules/` directory.
+2.  Re-run CMake to generate the build files.
+3.  Compile the core.
+4.  Enable the module in `worldserver.conf` (if configuration flags are added later).
+
+## 📡 Protocol (JSON)
+
+**Server -> Client (State):**
+```json
+{
+  "players": [
+    {
+      "name": "BotName",
+      "hp": 100,
+      "max_hp": 100,
+      "power": 50,
+      "combat": "true",
+      "target_status": "alive",
+      "nearby_mobs": [
+        {"guid": "12345", "name": "Wolf", "hp": 50, "attackable": "1"}
+      ],
+      "free_slots": 10,
+      "equipped_upgrade": "false",
+      "xp_gained": 0
+    }
+  ]
+}
+```
+### Client -> Server (Command):
+
+Format: PlayerName:Action:Value
+
+Example: BotName:cast:585 (Cast Smite)
+
+Example: BotName:move_to:-8949:-132:83
+
+## Requirements
+* AzerothCore 3.3.5a (WotLK)
+
+* MMaps must be extracted and enabled in worldserver.conf for pathfinding (move_to) to work correctly.
+
+## License
+This code is part of a custom AI research project and is provided "as is".
