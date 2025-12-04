@@ -25,7 +25,12 @@ It acts as a bridge between the World of Warcraft server logic and an external A
 * **Vendor Interaction:** Detects vendors and sells junk items automatically to free up bag space.
 * **Combat Tracking:** Automatically faces the target during combat/casting to prevent "Target not in front" errors.
 
-## 🛠 Architecture
+## Work in progress
+* **Qusting:** Detects nearby available quests and do them
+* **State management:** Depending on the characters needs, the AI is going to deceide what state is the most efficent (questing, exploring, moving to town/next zone etc.)
+* **Combat logic:** Reward the Ai for efficent/fast fights, provide a baseline rotation but let AI control cds.
+
+## Architecture
 
 The module hooks into the AzerothCore engine at two points:
 
@@ -42,7 +47,7 @@ The module hooks into the AzerothCore engine at two points:
 3.  Compile the core.
 4.  Enable the module in `worldserver.conf` (if configuration flags are added later).
 
-## 📡 Protocol (JSON)
+## Protocol (JSON)
 
 **Server -> Client (State):**
 ```json
