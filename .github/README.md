@@ -26,6 +26,7 @@ It acts as a bridge between the World of Warcraft server logic and an external A
 * **Combat Tracking:** Automatically faces the target during combat/casting to prevent "Target not in front" errors.
 
 ## Work in progress
+* **100% Serverside controll/scaling:** Atm a connected client is controlled. In the future the characters will be 100% serverside, allowing to spawn multiple instances to train more efficent.
 * **Qusting:** Detects nearby available quests and do them
 * **State management:** Depending on the characters needs, the AI is going to deceide what state is the most efficent (questing, exploring, moving to town/next zone etc.)
 * **Combat logic:** Reward the Ai for efficent/fast fights, provide a baseline rotation but let AI control cds.
