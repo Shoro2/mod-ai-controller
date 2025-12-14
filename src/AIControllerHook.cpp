@@ -17,13 +17,14 @@
 #include <queue>
 #include <sstream>
 #include <future> 
+#include <set> // Added for std::set
 #include "GameTime.h" 
 
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "CellImpl.h"
 #include "Cell.h"
-#include "Item.h"
+#include "Item.h"   
 #include "ItemTemplate.h"
 #include "Bag.h"
 #include "AccountMgr.h"
@@ -35,15 +36,17 @@
 // WICHTIG: Zuerst MySQLConnection, dann CharacterDatabase
 #include "MySQLConnection.h"
 
-// Wir binden CharacterDatabase.h über den relativen Pfad ein.
-#include "../../../src/server/database/Database/Implementation/CharacterDatabase.h"
+// Geht auch so
+#include "CharacterDatabase.h"
 
 using boost::asio::ip::tcp;
 using CharacterDatabasePreparedStatement = PreparedStatement<CharacterDatabaseConnection>;
 
+// HINWEIS: enum PlayerLoginQueryIndex wurde entfernt, da es bereits in Player.h definiert ist.
+
 // --- Bot Login Helper (Nachbau von LoginQueryHolder aus CharacterHandler.cpp) ---
 // ACHTUNG: Wir nutzen hier eine synchrone Implementierung!
-class BotLoginQueryHolder : public CharacterDatabaseQueryHolder {
+class BotLoginQueryHolder : public SQLQueryHolder<CharacterDatabaseConnection> {
 private:
     uint32 m_accountId;
     ObjectGuid m_guid;
@@ -61,16 +64,89 @@ public:
         bool res = true;
         ObjectGuid::LowType lowGuid = m_guid.GetCounter();
 
+        // SKIP LIST: Hier können IDs eingetragen werden, die "Assertion Failed" verursachen.
+        // 35 = CHAR_SEL_CHARACTER_AURAS (Verursachte den Crash)
+        // Falls 36 (Spells) auch crasht, einfach 36 hinzufügen.
+        std::set<int> skipList = {
+            CHAR_SEL_CHARACTER_AURAS
+            //, CHAR_SEL_CHARACTER_SPELL // Uncomment if Spells crash too
+        };
+
         // Helper Lambda für weniger Code-Duplizierung
-        auto LoadQuery = [&](CharacterDatabaseStatements index, PlayerLoginQueryIndex holderIndex) {
-            CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(index);
+        // FIX: Wir nutzen CharacterDatabase.Query(stmt).get() für synchrone Ausführung
+        auto LoadQuery = [&](CharacterDatabaseStatements index, PlayerLoginQueryIndex holderIndex) -> bool {
+
+            // 1. Check Skip List
+            if (skipList.find(index) != skipList.end()) {
+                LOG_WARN("module", "AI-DB: Skipping Query Index {} intentionally to prevent crash.", (int)index);
+                return false;
+            }
+
+            // SECURITY CHECK: Verhindert "Statement not found" Assertions/Crashes VOR dem Abruf
+            CharacterDatabasePreparedStatement* stmt = nullptr;
+            try {
+                stmt = CharacterDatabase.GetPreparedStatement(index);
+            }
+            catch (...) {
+                LOG_ERROR("module", "AI-DB: Exception getting PreparedStatement index {}", (int)index);
+                return false;
+            }
+
+            if (!stmt) {
+                // Das Statement existiert nicht (z.B. falscher Index oder DB Version mismatch). 
+                // Wir loggen es und brechen ab, aber crashen nicht.
+                LOG_ERROR("module", "AI-DB: Statement {} skipped (not found/null) - Check DB definitions!", (int)index);
+                return false;
+            }
+
             stmt->SetData(0, lowGuid);
-            // Wir nutzen CharacterDatabase.Query (synchron) statt AsyncQuery!
-            SetPreparedResult(holderIndex, CharacterDatabase.Query(stmt).get());
+
+            PreparedResultSet* result = nullptr;
+            try {
+                // Future abwarten und Ergebnis holen
+                // HIER passierte der "m_mStmt" Assert Crash, weil das Statement auf der Connection fehlte.
+                // Durch die skipList oben verhindern wir das Ausführen für bekannte Problem-Statements.
+                auto futureResult = CharacterDatabase.Query(stmt);
+                result = futureResult.get();
+            }
+            catch (std::exception& e) {
+                LOG_ERROR("module", "AIController: Exception during DB Query execution (Idx {}): {}", (int)index, e.what());
+                return false;
+            }
+            catch (...) {
+                LOG_ERROR("module", "AIController: Unknown Exception during DB Query execution (Idx {}).", (int)index);
+                return false;
+            }
+
+            // CRASH FIX für Vector Subscript:
+            // Auch ein leeres Ergebnis (RowCount == 0) ist ein gültiges Ergebnis (z.B. leeres Inventar).
+            // Wir müssen es an SetPreparedResult übergeben, damit LoadFromDB weiß "Aha, Inventar ist leer" 
+            // statt "Huch, Inventar wurde nicht geladen -> Crash".
+
+            if (!result) {
+                // Wenn NULL zurückkommt (Query failed), dann geben wir false zurück.
+                // LoadFromDB wird diesen Teil überspringen.
+                return false;
+            }
+
+            // Wir übergeben das Ergebnis IMMER, auch wenn es 0 Zeilen hat.
+            SetPreparedResult(holderIndex, result);
+            return true;
             };
 
-        LoadQuery(CHAR_SEL_CHARACTER, PLAYER_LOGIN_QUERY_LOAD_FROM);
-        LoadQuery(CHAR_SEL_CHARACTER_AURAS, PLAYER_LOGIN_QUERY_LOAD_AURAS);
+        // Das wichtigste Statement: Basis-Infos (Name, Rasse, Klasse etc.)
+        if (!LoadQuery(CHAR_SEL_CHARACTER_AT_LOGIN, PLAYER_LOGIN_QUERY_LOAD_FROM))
+        {
+            LOG_ERROR("module", "AIController: Failed to load basic character data for GUID {} (Query returned null)", lowGuid);
+            return false;
+        }
+
+        // --- RESTORED CORE LOGIC ---
+        // Wir laden nun alle Standard-Daten.
+        // Problemfälle (wie AURAS) werden durch die skipList oben abgefangen.
+        // WICHTIG: Inventory und Skills MÜSSEN geladen werden (auch wenn leer), sonst droht "Vector subscript out of range".
+
+        LoadQuery(CHAR_SEL_CHARACTER_AURAS, PLAYER_LOGIN_QUERY_LOAD_AURAS); // Wird geskippt durch skipList
         LoadQuery(CHAR_SEL_CHARACTER_SPELL, PLAYER_LOGIN_QUERY_LOAD_SPELLS);
         LoadQuery(CHAR_SEL_CHARACTER_QUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_QUEST_STATUS);
         LoadQuery(CHAR_SEL_CHARACTER_DAILYQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_DAILY_QUEST_STATUS);
@@ -78,53 +154,38 @@ public:
         LoadQuery(CHAR_SEL_CHARACTER_MONTHLYQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_MONTHLY_QUEST_STATUS);
         LoadQuery(CHAR_SEL_CHARACTER_SEASONALQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_SEASONAL_QUEST_STATUS);
         LoadQuery(CHAR_SEL_CHARACTER_REPUTATION, PLAYER_LOGIN_QUERY_LOAD_REPUTATION);
-        LoadQuery(CHAR_SEL_CHARACTER_INVENTORY, PLAYER_LOGIN_QUERY_LOAD_INVENTORY);
+        LoadQuery(CHAR_SEL_CHARACTER_INVENTORY, PLAYER_LOGIN_QUERY_LOAD_INVENTORY); // Kritisch für Vector Crash!
         LoadQuery(CHAR_SEL_CHARACTER_ACTIONS, PLAYER_LOGIN_QUERY_LOAD_ACTIONS);
+        LoadQuery(CHAR_SEL_CHARACTER_SKILLS, PLAYER_LOGIN_QUERY_LOAD_SKILLS); // Kritisch!
 
-        // Mail Special Case
-        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAIL);
-        stmt->SetData(0, lowGuid);
-        stmt->SetData(1, uint32(time(nullptr)));
-        SetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MAILS, CharacterDatabase.Query(stmt).get());
-
-        LoadQuery(CHAR_SEL_MAILITEMS, PLAYER_LOGIN_QUERY_LOAD_MAIL_ITEMS);
-        LoadQuery(CHAR_SEL_CHARACTER_SOCIALLIST, PLAYER_LOGIN_QUERY_LOAD_SOCIAL_LIST);
-        LoadQuery(CHAR_SEL_CHARACTER_HOMEBIND, PLAYER_LOGIN_QUERY_LOAD_HOME_BIND);
-        LoadQuery(CHAR_SEL_CHARACTER_SPELLCOOLDOWNS, PLAYER_LOGIN_QUERY_LOAD_SPELL_COOLDOWNS);
-
-        if (sWorld->getBoolConfig(CONFIG_DECLINED_NAMES_USED))
-            LoadQuery(CHAR_SEL_CHARACTER_DECLINEDNAMES, PLAYER_LOGIN_QUERY_LOAD_DECLINED_NAMES);
-
-        LoadQuery(CHAR_SEL_CHARACTER_ACHIEVEMENTS, PLAYER_LOGIN_QUERY_LOAD_ACHIEVEMENTS);
-        LoadQuery(CHAR_SEL_CHARACTER_CRITERIAPROGRESS, PLAYER_LOGIN_QUERY_LOAD_CRITERIA_PROGRESS);
         LoadQuery(CHAR_SEL_CHARACTER_EQUIPMENTSETS, PLAYER_LOGIN_QUERY_LOAD_EQUIPMENT_SETS);
-        LoadQuery(CHAR_SEL_CHARACTER_ENTRY_POINT, PLAYER_LOGIN_QUERY_LOAD_ENTRY_POINT);
         LoadQuery(CHAR_SEL_CHARACTER_GLYPHS, PLAYER_LOGIN_QUERY_LOAD_GLYPHS);
         LoadQuery(CHAR_SEL_CHARACTER_TALENTS, PLAYER_LOGIN_QUERY_LOAD_TALENTS);
-        LoadQuery(CHAR_SEL_PLAYER_ACCOUNT_DATA, PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_DATA);
-        LoadQuery(CHAR_SEL_CHARACTER_SKILLS, PLAYER_LOGIN_QUERY_LOAD_SKILLS);
-        LoadQuery(CHAR_SEL_CHARACTER_RANDOMBG, PLAYER_LOGIN_QUERY_LOAD_RANDOM_BG);
-        LoadQuery(CHAR_SEL_CHARACTER_BANNED, PLAYER_LOGIN_QUERY_LOAD_BANNED);
-        LoadQuery(CHAR_SEL_CHARACTER_QUESTSTATUSREW, PLAYER_LOGIN_QUERY_LOAD_QUEST_STATUS_REW);
-        LoadQuery(CHAR_SEL_BREW_OF_THE_MONTH, PLAYER_LOGIN_QUERY_LOAD_BREW_OF_THE_MONTH);
 
-        // Instance Lock Times Special Case (Account ID)
-        // CRASH FIX: Diese Query (CHAR_SEL_ACCOUNT_INSTANCELOCKTIMES) ist oft nur "ASYNC" verfügbar.
-        // Da wir hier synchron laden, führt dies zum Crash, da das Statement auf der Sync-Connection fehlt.
-        // Wir deaktivieren das Laden von Instance-Locks für Bots.
+        // Weitere (weniger kritisch, aber gut für Vollständigkeit):
+        // LoadQuery(CHAR_SEL_CHARACTER_HOMEBIND, PLAYER_LOGIN_QUERY_LOAD_HOME_BIND);
+        // LoadQuery(CHAR_SEL_CHARACTER_SPELLCOOLDOWNS, PLAYER_LOGIN_QUERY_LOAD_SPELL_COOLDOWNS);
+
         /*
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_INSTANCELOCKTIMES);
-        stmt->SetData(0, m_accountId);
-        SetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_INSTANCE_LOCK_TIMES, CharacterDatabase.Query(stmt).get());
+        if (sWorld->getBoolConfig(CONFIG_DECLINED_NAMES_USED))
+            LoadQuery(CHAR_SEL_CHARACTER_DECLINEDNAMES, PLAYER_LOGIN_QUERY_LOAD_DECLINED_NAMES);
         */
-        LOG_INFO("module", "AI-BOT: Skipping Instance Lock Times load to avoid synchronous crash.");
 
-        LoadQuery(CHAR_SEL_CORPSE_LOCATION, PLAYER_LOGIN_QUERY_LOAD_CORPSE_LOCATION);
-        LoadQuery(CHAR_SEL_CHAR_SETTINGS, PLAYER_LOGIN_QUERY_LOAD_CHARACTER_SETTINGS);
-        LoadQuery(CHAR_SEL_CHAR_PETS, PLAYER_LOGIN_QUERY_LOAD_PET_SLOTS);
-        LoadQuery(CHAR_SEL_CHAR_ACHIEVEMENT_OFFLINE_UPDATES, PLAYER_LOGIN_QUERY_LOAD_OFFLINE_ACHIEVEMENTS_UPDATES);
+        // LoadQuery(CHAR_SEL_CHARACTER_ACHIEVEMENTS, PLAYER_LOGIN_QUERY_LOAD_ACHIEVEMENTS);
+        // LoadQuery(CHAR_SEL_CHARACTER_CRITERIAPROGRESS, PLAYER_LOGIN_QUERY_LOAD_CRITERIA_PROGRESS);
+        // LoadQuery(CHAR_SEL_CHARACTER_ENTRY_POINT, PLAYER_LOGIN_QUERY_LOAD_ENTRY_POINT);
+        // LoadQuery(CHAR_SEL_ACCOUNT_DATA, PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_DATA);
+        // LoadQuery(CHAR_SEL_CHARACTER_RANDOMBG, PLAYER_LOGIN_QUERY_LOAD_RANDOM_BG);
+        // LoadQuery(CHAR_SEL_CHARACTER_BANNED, PLAYER_LOGIN_QUERY_LOAD_BANNED);
+        // LoadQuery(CHAR_SEL_CHARACTER_QUESTSTATUSREW, PLAYER_LOGIN_QUERY_LOAD_QUEST_STATUS_REW);
+        // LoadQuery(CHAR_SEL_BREW_OF_THE_MONTH, PLAYER_LOGIN_QUERY_LOAD_BREW_OF_THE_MONTH);
 
-        return true; // Wir nehmen an, es hat geklappt (für den Bot-Kontext reicht das meist)
+        // LoadQuery(CHAR_SEL_CORPSE_LOCATION, PLAYER_LOGIN_QUERY_LOAD_CORPSE_LOCATION);
+        // LoadQuery(CHAR_SEL_CHAR_SETTINGS, PLAYER_LOGIN_QUERY_LOAD_CHARACTER_SETTINGS);
+        // LoadQuery(CHAR_SEL_CHAR_PETS, PLAYER_LOGIN_QUERY_LOAD_PET_SLOTS);
+        // LoadQuery(CHAR_SEL_CHAR_ACHIEVEMENT_OFFLINE_UPDATES, PLAYER_LOGIN_QUERY_LOAD_OFFLINE_ACHIEVEMENTS_UPDATES);
+
+        return true;
     }
 };
 
@@ -570,6 +631,8 @@ public:
 
             LOG_INFO("module", "AI-DEBUG: Versuche Bot zu spawnen: '{}'", botName);
 
+            // ACHTUNG: Hier muss sCharacterCache evtl. durch eine entsprechende Methode in Ihrem Core ersetzt werden,
+            // falls GetCharacterGuidByName dort anders heißt.
             ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(botName);
             if (!guid) {
                 ChatHandler(player->GetSession()).SendSysMessage("Charakter nicht gefunden.");
@@ -644,6 +707,7 @@ public:
             Player* botPlayer = new Player(botSession);
 
             // Cast zu Basisklasse für LoadFromDB (signatur erwartet CharacterDatabaseQueryHolder)
+            // Hinweis: *holder wird als Referenz übergeben (dereferenziert).
             if (!botPlayer->LoadFromDB(holder->GetGuid(), *holder)) {
                 LOG_ERROR("module", "FAIL: Player konnte nicht geladen werden.");
                 delete botPlayer;
