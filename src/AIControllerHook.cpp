@@ -16,8 +16,7 @@
 #include <string>
 #include <queue>
 #include <sstream>
-#include <future> 
-#include <set> // Added for std::set
+#include <unordered_map>
 #include "GameTime.h" 
 
 #include "GridNotifiers.h"
@@ -32,6 +31,8 @@
 #include "PreparedStatement.h"
 #include "QueryHolder.h"
 #include "DatabaseWorkerPool.h"
+#include "AsyncCallbackProcessor.h"
+#include "ObjectMgr.h"
 
 // WICHTIG: Zuerst MySQLConnection, dann CharacterDatabase
 #include "MySQLConnection.h"
@@ -45,8 +46,8 @@ using CharacterDatabasePreparedStatement = PreparedStatement<CharacterDatabaseCo
 // HINWEIS: enum PlayerLoginQueryIndex wurde entfernt, da es bereits in Player.h definiert ist.
 
 // --- Bot Login Helper (Nachbau von LoginQueryHolder aus CharacterHandler.cpp) ---
-// ACHTUNG: Wir nutzen hier eine synchrone Implementierung!
-class BotLoginQueryHolder : public SQLQueryHolder<CharacterDatabaseConnection> {
+// WICHTIG: Async-Holder wie im Core-Login, damit ASYNC PreparedStatements genutzt werden.
+class BotLoginQueryHolder : public CharacterDatabaseQueryHolder {
 private:
     uint32 m_accountId;
     ObjectGuid m_guid;
@@ -64,95 +65,70 @@ public:
         bool res = true;
         ObjectGuid::LowType lowGuid = m_guid.GetCounter();
 
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_FROM, stmt);
 
-        // Helper Lambda für weniger Code-Duplizierung
-        // FIX: Wir nutzen CharacterDatabase.Query(stmt).get() für synchrone Ausführung
-        auto LoadQuery = [&](CharacterDatabaseStatements index, PlayerLoginQueryIndex holderIndex) -> bool {
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_AURAS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_AURAS, stmt);
 
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_SPELL);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_SPELLS, stmt);
 
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_QUESTSTATUS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_QUEST_STATUS, stmt);
 
-            // SECURITY CHECK: Verhindert "Statement not found" Assertions/Crashes VOR dem Abruf
-            CharacterDatabasePreparedStatement* stmt = nullptr;
-            try {
-                stmt = CharacterDatabase.GetPreparedStatement(index);
-            }
-            catch (...) {
-                LOG_ERROR("module", "AI-DB: Exception getting PreparedStatement index {}", (int)index);
-                return false;
-            }
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_DAILYQUESTSTATUS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_DAILY_QUEST_STATUS, stmt);
 
-            if (!stmt) {
-                // Das Statement existiert nicht (z.B. falscher Index oder DB Version mismatch). 
-                // Wir loggen es und brechen ab, aber crashen nicht.
-                LOG_ERROR("module", "AI-DB: Statement {} skipped (not found/null) - Check DB definitions!", (int)index);
-                return false;
-            }
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_WEEKLYQUESTSTATUS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_WEEKLY_QUEST_STATUS, stmt);
 
-            stmt->SetData(0, lowGuid);
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_MONTHLYQUESTSTATUS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_MONTHLY_QUEST_STATUS, stmt);
 
-            PreparedResultSet* result = nullptr;
-            try {
-                // Future abwarten und Ergebnis holen
-                // HIER passierte der "m_mStmt" Assert Crash, weil das Statement auf der Connection fehlte.
-                // Durch die skipList oben verhindern wir das Ausführen für bekannte Problem-Statements.
-                auto futureResult = CharacterDatabase.Query(stmt);
-                result = futureResult.get();
-            }
-            catch (std::exception& e) {
-                LOG_ERROR("module", "AIController: Exception during DB Query execution (Idx {}): {}", (int)index, e.what());
-                return false;
-            }
-            catch (...) {
-                LOG_ERROR("module", "AIController: Unknown Exception during DB Query execution (Idx {}).", (int)index);
-                return false;
-            }
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_SEASONALQUESTSTATUS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_SEASONAL_QUEST_STATUS, stmt);
 
-            // CRASH FIX für Vector Subscript:
-            // Auch ein leeres Ergebnis (RowCount == 0) ist ein gültiges Ergebnis (z.B. leeres Inventar).
-            // Wir müssen es an SetPreparedResult übergeben, damit LoadFromDB weiß "Aha, Inventar ist leer" 
-            // statt "Huch, Inventar wurde nicht geladen -> Crash".
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_REPUTATION);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_REPUTATION, stmt);
 
-            if (!result) {
-                // Wenn NULL zurückkommt (Query failed), dann geben wir false zurück.
-                // LoadFromDB wird diesen Teil überspringen.
-                return false;
-            }
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_INVENTORY);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_INVENTORY, stmt);
 
-            // Wir übergeben das Ergebnis IMMER, auch wenn es 0 Zeilen hat.
-            SetPreparedResult(holderIndex, result);
-            return true;
-            };
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_ACTIONS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACTIONS, stmt);
 
-        // Das wichtigste Statement: Basis-Infos (Name, Rasse, Klasse etc.)
-        if (!LoadQuery(CHAR_SEL_CHARACTER_AT_LOGIN, PLAYER_LOGIN_QUERY_LOAD_FROM))
-        {
-            LOG_ERROR("module", "AIController: Failed to load basic character data for GUID {} (Query returned null)", lowGuid);
-            return false;
-        }
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_SKILLS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_SKILLS, stmt);
 
-        // --- RESTORED CORE LOGIC ---
-        // Wir laden nun alle Standard-Daten.
-        // Problemfälle (wie AURAS) werden durch die skipList oben abgefangen.
-        // WICHTIG: Inventory und Skills MÜSSEN geladen werden (auch wenn leer), sonst droht "Vector subscript out of range".
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_EQUIPMENTSETS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_EQUIPMENT_SETS, stmt);
 
-        LoadQuery(CHAR_SEL_CHARACTER_AURAS, PLAYER_LOGIN_QUERY_LOAD_AURAS); // Wird geskippt durch skipList
-        LoadQuery(CHAR_SEL_CHARACTER_SPELL, PLAYER_LOGIN_QUERY_LOAD_SPELLS);
-        LoadQuery(CHAR_SEL_CHARACTER_QUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_QUEST_STATUS);
-        LoadQuery(CHAR_SEL_CHARACTER_DAILYQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_DAILY_QUEST_STATUS);
-        LoadQuery(CHAR_SEL_CHARACTER_WEEKLYQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_WEEKLY_QUEST_STATUS);
-        LoadQuery(CHAR_SEL_CHARACTER_MONTHLYQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_MONTHLY_QUEST_STATUS);
-        LoadQuery(CHAR_SEL_CHARACTER_SEASONALQUESTSTATUS, PLAYER_LOGIN_QUERY_LOAD_SEASONAL_QUEST_STATUS);
-        LoadQuery(CHAR_SEL_CHARACTER_REPUTATION, PLAYER_LOGIN_QUERY_LOAD_REPUTATION);
-        LoadQuery(CHAR_SEL_CHARACTER_INVENTORY, PLAYER_LOGIN_QUERY_LOAD_INVENTORY); // Kritisch für Vector Crash!
-        LoadQuery(CHAR_SEL_CHARACTER_ACTIONS, PLAYER_LOGIN_QUERY_LOAD_ACTIONS);
-        LoadQuery(CHAR_SEL_CHARACTER_SKILLS, PLAYER_LOGIN_QUERY_LOAD_SKILLS); // Kritisch!
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_GLYPHS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_GLYPHS, stmt);
 
-        LoadQuery(CHAR_SEL_CHARACTER_EQUIPMENTSETS, PLAYER_LOGIN_QUERY_LOAD_EQUIPMENT_SETS);
-        LoadQuery(CHAR_SEL_CHARACTER_GLYPHS, PLAYER_LOGIN_QUERY_LOAD_GLYPHS);
-        LoadQuery(CHAR_SEL_CHARACTER_TALENTS, PLAYER_LOGIN_QUERY_LOAD_TALENTS);
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_TALENTS);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_TALENTS, stmt);
 
         // Weitere (weniger kritisch, aber gut für Vollständigkeit):
-        // LoadQuery(CHAR_SEL_CHARACTER_HOMEBIND, PLAYER_LOGIN_QUERY_LOAD_HOME_BIND);
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_HOMEBIND);
+        stmt->SetData(0, lowGuid);
+        res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_HOME_BIND, stmt);
         // LoadQuery(CHAR_SEL_CHARACTER_SPELLCOOLDOWNS, PLAYER_LOGIN_QUERY_LOAD_SPELL_COOLDOWNS);
 
         /*
@@ -174,7 +150,7 @@ public:
         // LoadQuery(CHAR_SEL_CHAR_PETS, PLAYER_LOGIN_QUERY_LOAD_PET_SLOTS);
         // LoadQuery(CHAR_SEL_CHAR_ACHIEVEMENT_OFFLINE_UPDATES, PLAYER_LOGIN_QUERY_LOAD_OFFLINE_ACHIEVEMENTS_UPDATES);
 
-        return true;
+        return res;
     }
 };
 
@@ -195,6 +171,9 @@ bool g_LeveledUp = false;
 long long g_LootCopper = 0;
 long long g_LootScore = 0;
 bool g_EquippedUpgrade = false;
+AsyncCallbackProcessor<SQLQueryHolderCallback> g_QueryHolderProcessor;
+std::unordered_map<uint32, WorldSession*> g_BotSessions;
+std::mutex g_BotSessionsMutex;
 
 // --- HELPER ---
 
@@ -361,6 +340,8 @@ public:
                 }
             }
         }
+
+        g_QueryHolderProcessor.ProcessReadyCallbacks();
 
         {
             std::lock_guard<std::mutex> lock(g_Mutex);
@@ -604,19 +585,18 @@ public:
 
     void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& msg) override {
         std::string commandPrefix = "#spawn";
+        std::string commandSpawnAll = "#spawnbots";
 
-        if (msg.length() >= commandPrefix.length() && msg.substr(0, commandPrefix.length()) == commandPrefix) {
-
-            LOG_INFO("module", "AI-DEBUG: Chat von {}: '{}'", player->GetName(), msg);
-
-            if (msg.length() <= commandPrefix.length() + 1) {
-                ChatHandler(player->GetSession()).SendSysMessage("Benutzung: #spawn <BotName>");
-                msg = "";
-                return;
+        auto spawnBotByName = [player, &msg](std::string const& botName) -> bool {
+            if (botName.empty()) {
+                ChatHandler(player->GetSession()).SendSysMessage("Bot-Name fehlt.");
+                return false;
             }
 
-            std::string botName = msg.substr(commandPrefix.length() + 1);
-            if (!botName.empty() && botName.back() == ' ') botName.pop_back();
+            if (ObjectAccessor::FindPlayerByName(botName)) {
+                ChatHandler(player->GetSession()).SendSysMessage("Bot ist bereits online.");
+                return false;
+            }
 
             LOG_INFO("module", "AI-DEBUG: Versuche Bot zu spawnen: '{}'", botName);
 
@@ -625,14 +605,7 @@ public:
             ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(botName);
             if (!guid) {
                 ChatHandler(player->GetSession()).SendSysMessage("Charakter nicht gefunden.");
-                msg = "";
-                return;
-            }
-
-            if (ObjectAccessor::FindPlayerByName(botName)) {
-                ChatHandler(player->GetSession()).SendSysMessage("Bot ist bereits online.");
-                msg = "";
-                return;
+                return false;
             }
 
             LOG_INFO("module", "DEBUG STEP 1: Hole AccountID...");
@@ -641,34 +614,28 @@ public:
 
             if (accountId == 0) {
                 ChatHandler(player->GetSession()).SendSysMessage("Fehler: Ungültige AccountID.");
-                msg = "";
-                return;
+                return false;
             }
 
             if (sWorldSessionMgr->FindSession(accountId)) {
                 LOG_ERROR("module", "ABORT: Account {} ist bereits eingeloggt!", accountId);
                 ChatHandler(player->GetSession()).SendSysMessage("Fehler: Account bereits eingeloggt.");
-                msg = "";
-                return;
+                return false;
             }
 
-            // --- NEUE SYNCHRONE LADESTRATEGIE (Playerbot-Style) ---
-            LOG_INFO("module", "DEBUG STEP 3: Starte synchronen Login...");
-
-            // 1. Holder erstellen
-            auto holder = std::make_shared<BotLoginQueryHolder>(accountId, guid);
-
-            // 2. Initialisieren (führt alle Queries SYNCHRON aus!)
-            if (!holder->Initialize()) {
-                LOG_ERROR("module", "FAIL: Konnte LoginQueryHolder nicht initialisieren.");
-                ChatHandler(player->GetSession()).SendSysMessage("Interner DB-Fehler (Init).");
-                msg = "";
-                return;
+            {
+                std::lock_guard<std::mutex> lock(g_BotSessionsMutex);
+                if (g_BotSessions.find(accountId) != g_BotSessions.end()) {
+                    LOG_ERROR("module", "ABORT: Bot-Session für Account {} existiert bereits.", accountId);
+                    ChatHandler(player->GetSession()).SendSysMessage("Fehler: Bot bereits aktiv.");
+                    return false;
+                }
             }
 
-            LOG_INFO("module", "DEBUG STEP 4: DB-Daten geladen. Erstelle Session...");
+            // --- ASYNCHRONE LADESTRATEGIE (Core-Login-Flow) ---
+            LOG_INFO("module", "DEBUG STEP 3: Starte asynchronen Login...");
 
-            // 4. Session erstellen (IsBot simuliert durch Flags oder manuelles Handling, da Konstruktor nur 12 Args hat)
+            // 1. Session erstellen (IsBot simuliert durch Flags oder manuelles Handling, da Konstruktor nur 12 Args hat)
             WorldSession* botSession = new WorldSession(
                 accountId,
                 std::string(botName),
@@ -684,50 +651,126 @@ public:
                 0
             );
 
-            // TRICK: Setze InQueue=true, um den Idle-Timeout (Kick) zu verhindern, da wir keinen Socket haben.
-            botSession->SetInQueue(true);
+            // 2. Holder erstellen
+            auto holder = std::make_shared<BotLoginQueryHolder>(accountId, guid);
 
-            // WICHTIG: Session MUSS im Manager sein
-            sWorldSessionMgr->AddSession(botSession);
+            // 3. Initialisieren (nur PreparedStatements setzen)
+            if (!holder->Initialize()) {
+                LOG_ERROR("module", "FAIL: Konnte LoginQueryHolder nicht initialisieren.");
+                ChatHandler(player->GetSession()).SendSysMessage("Interner DB-Fehler (Init).");
+                delete botSession;
+                return false;
+            }
 
-            LOG_INFO("module", "DEBUG STEP 5: Erstelle Player und lade aus DB...");
+            LOG_INFO("module", "DEBUG STEP 4: DB-Queries gestartet...");
 
-            // 5. Player laden mit den vorbereiteten Daten (DIREKT, kein Callback!)
-            Player* botPlayer = new Player(botSession);
+            {
+                std::lock_guard<std::mutex> lock(g_BotSessionsMutex);
+                g_BotSessions[accountId] = botSession;
+            }
 
-            // Cast zu Basisklasse für LoadFromDB (signatur erwartet CharacterDatabaseQueryHolder)
-            // Hinweis: *holder wird als Referenz übergeben (dereferenziert).
-            if (!botPlayer->LoadFromDB(holder->GetGuid(), *holder)) {
-                LOG_ERROR("module", "FAIL: Player konnte nicht geladen werden.");
-                delete botPlayer;
-                sWorldSessionMgr->KickSession(accountId);
+            g_QueryHolderProcessor.AddCallback(CharacterDatabase.DelayQueryHolder(holder)).AfterComplete(
+                [accountId, guid, botName](SQLQueryHolderBase const& holderBase)
+                {
+                    WorldSession* session = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(g_BotSessionsMutex);
+                        auto it = g_BotSessions.find(accountId);
+                        if (it != g_BotSessions.end())
+                            session = it->second;
+                    }
+                    if (!session)
+                    {
+                        LOG_ERROR("module", "Bot-Login: Session für Account {} nicht gefunden.", accountId);
+                        return;
+                    }
+
+                    auto const& typedHolder = static_cast<BotLoginQueryHolder const&>(holderBase);
+                    Player* botPlayer = new Player(session);
+
+                    if (!botPlayer->LoadFromDB(guid, typedHolder))
+                    {
+                        LOG_ERROR("module", "FAIL: Player konnte nicht geladen werden.");
+                        delete botPlayer;
+                        std::lock_guard<std::mutex> lock(g_BotSessionsMutex);
+                        auto it = g_BotSessions.find(accountId);
+                        if (it != g_BotSessions.end())
+                        {
+                            delete it->second;
+                            g_BotSessions.erase(it);
+                        }
+                        return;
+                    }
+
+                    LOG_INFO("module", "DEBUG STEP 5: Player geladen: {}", botPlayer->GetName());
+
+                    session->SetPlayer(botPlayer);
+
+                    botPlayer->GetMotionMaster()->Initialize();
+                    botPlayer->SendInitialPacketsBeforeAddToMap();
+
+                    ObjectAccessor::AddObject(botPlayer);
+
+                    if (!botPlayer->GetMap()->AddPlayerToMap(botPlayer) || !botPlayer->CheckInstanceLoginValid())
+                    {
+                        AreaTriggerTeleport const* at = sObjectMgr->GetGoBackTrigger(botPlayer->GetMapId());
+                        if (at)
+                        {
+                            botPlayer->TeleportTo(at->target_mapId, at->target_X, at->target_Y, at->target_Z, botPlayer->GetOrientation());
+                        }
+                        else
+                        {
+                            botPlayer->TeleportTo(botPlayer->m_homebindMapId, botPlayer->m_homebindX, botPlayer->m_homebindY, botPlayer->m_homebindZ, botPlayer->GetOrientation());
+                        }
+
+                        botPlayer->GetSession()->SendNameQueryOpcode(botPlayer->GetGUID());
+                    }
+
+                    botPlayer->SendInitialPacketsAfterAddToMap();
+
+                    CharacterDatabasePreparedStatement* onlineStmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
+                    onlineStmt->SetData(0, botPlayer->GetGUID().GetCounter());
+                    CharacterDatabase.Execute(onlineStmt);
+
+                    constexpr uint32 kSpawnMapId = 0;
+                    constexpr float kSpawnX = -8921.037f;
+                    constexpr float kSpawnY = -120.484985f;
+                    constexpr float kSpawnZ = 82.02542f;
+                    constexpr float kSpawnO = 3.299f;
+
+                    botPlayer->TeleportTo(kSpawnMapId, kSpawnX, kSpawnY, kSpawnZ, kSpawnO);
+
+                    LOG_INFO("module", "DEBUG STEP 6: Bot '{}' erfolgreich gespawnt.", botName);
+                });
+
+            msg = "";
+            return true;
+        };
+
+        if (msg.length() >= commandSpawnAll.length() && msg.substr(0, commandSpawnAll.length()) == commandSpawnAll) {
+            LOG_INFO("module", "AI-DEBUG: Chat von {}: '{}'", player->GetName(), msg);
+            std::vector<std::string> botNames = { "Bota", "Botb", "Botc", "Botd", "Bote" };
+            for (std::string const& botName : botNames) {
+                spawnBotByName(botName);
+            }
+            msg = "";
+            return;
+        }
+
+        if (msg.length() >= commandPrefix.length() && msg.substr(0, commandPrefix.length()) == commandPrefix) {
+
+            LOG_INFO("module", "AI-DEBUG: Chat von {}: '{}'", player->GetName(), msg);
+
+            if (msg.length() <= commandPrefix.length() + 1) {
+                ChatHandler(player->GetSession()).SendSysMessage("Benutzung: #spawn <BotName>");
+                msg = "";
                 return;
             }
 
-            LOG_INFO("module", "DEBUG STEP 6: Player geladen: {}", botPlayer->GetName());
+            std::string botName = msg.substr(commandPrefix.length() + 1);
+            if (!botName.empty() && botName.back() == ' ') botName.pop_back();
 
-            // Session verknüpfen
-            botSession->SetPlayer(botPlayer);
-
-            // Zur Welt hinzufügen
-            botPlayer->GetMotionMaster()->Initialize();
-            botPlayer->SetMap(botPlayer->GetMap());
-            botPlayer->AddToWorld();
-
-            // Initialisierungs-Pakete senden (simuliert)
-            botPlayer->SendInitialPacketsBeforeAddToMap();
-            botPlayer->SendInitialPacketsAfterAddToMap();
-
-            // Teleport zum Beschwörer (wichtig!)
-            botPlayer->TeleportTo(player->GetMapId(), player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetOrientation());
-
-            // Reset Queue Flag, da wir jetzt "drin" sind
-            botSession->SetInQueue(false);
-
-            LOG_INFO("module", "DEBUG STEP 7: Fertig!");
-            ChatHandler(player->GetSession()).SendSysMessage("Bot erfolgreich gespawnt!");
-
-            msg = "";
+            spawnBotByName(botName);
         }
     }
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource) override {
