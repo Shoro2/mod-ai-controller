@@ -64,23 +64,12 @@ public:
         bool res = true;
         ObjectGuid::LowType lowGuid = m_guid.GetCounter();
 
-        // SKIP LIST: Hier können IDs eingetragen werden, die "Assertion Failed" verursachen.
-        // 35 = CHAR_SEL_CHARACTER_AURAS (Verursachte den Crash)
-        // Falls 36 (Spells) auch crasht, einfach 36 hinzufügen.
-        std::set<int> skipList = {
-            CHAR_SEL_CHARACTER_AURAS
-            //, CHAR_SEL_CHARACTER_SPELL // Uncomment if Spells crash too
-        };
 
         // Helper Lambda für weniger Code-Duplizierung
         // FIX: Wir nutzen CharacterDatabase.Query(stmt).get() für synchrone Ausführung
         auto LoadQuery = [&](CharacterDatabaseStatements index, PlayerLoginQueryIndex holderIndex) -> bool {
 
-            // 1. Check Skip List
-            if (skipList.find(index) != skipList.end()) {
-                LOG_WARN("module", "AI-DB: Skipping Query Index {} intentionally to prevent crash.", (int)index);
-                return false;
-            }
+
 
             // SECURITY CHECK: Verhindert "Statement not found" Assertions/Crashes VOR dem Abruf
             CharacterDatabasePreparedStatement* stmt = nullptr;
